@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""
+vllman - tiny YAML-driven Podman lifecycle wrapper for vLLM model runners.
+
+Default config path:
+  /opt/modelrunners/<name>.yaml
+
+Examples:
+  vllman run gemma-4-31b
+  vllman test gemma-4-31b
+  vllman start gemma-4-31b
+  vllman stop gemma-4-31b
+  vllman remove gemma-4-31b
+  vllman logs -f gemma-4-31b
+  vllman --dry-run run gemma-4-31b
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+try:
+    import yaml
+except ImportError:
+    print(
+        "Missing dependency: PyYAML. Install it with: python3 -m pip install pyyaml",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+DEFAULT_CONFIG_DIR = Path(os.environ.get("VLLMAN_CONFIG_DIR", "/opt/modelrunners"))
+DEFAULT_CONTAINER_PREFIX = os.environ.get("VLLMAN_CONTAINER_PREFIX", "vllm-")
+DEFAULT_CONTAINER_HOST = "localhost"
+DEFAULT_CONTAINER_PORT = 8000
+DEFAULT_NETWORK = os.environ.get("VLLMAN_NETWORK", "dualstack")
+DEFAULT_HF_CACHE_VOLUME = os.environ.get(
+    "VLLMAN_HF_CACHE_VOLUME",
+    "/root/.cache/huggingface:/root/.cache/huggingface",
+)
+
+_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
+
+class VllmanError(Exception):
+    """User-facing error."""
+
+
+def die(message: str, exit_code: int = 1) -> None:
+    print(f"vllman: error: {message}", file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def ensure_mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise VllmanError(f"{label} must be a mapping/object")
+    return value
+
+
+def validate_name(name: str) -> None:
+    if not _NAME_RE.match(name):
+        raise VllmanError(
+            f"invalid model runner name {name!r}; use letters, digits, dot, underscore, or dash"
+        )
+
+
+def config_path_for_name(name: str, config_dir: Path) -> Path:
+    validate_name(name)
+    return config_dir / f"{name}.yaml"
+
+
+def load_config(name: str, config_dir: Path) -> dict[str, Any]:
+    path = config_path_for_name(name, config_dir)
+    if not path.exists():
+        raise VllmanError(f"config not found: {path}")
+    if not path.is_file():
+        raise VllmanError(f"config path is not a file: {path}")
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        raise VllmanError(f"invalid YAML in {path}: {exc}") from exc
+    except OSError as exc:
+        raise VllmanError(f"could not read {path}: {exc}") from exc
+
+    cfg = ensure_mapping(cfg, str(path))
+    cfg.setdefault("name", name)
+    cfg["_config_path"] = str(path)
+    validate_config(cfg)
+    return cfg
+
+
+def validate_config(cfg: dict[str, Any]) -> None:
+    required = ["model", "name", "runtime", "port"]
+    missing = [key for key in required if key not in cfg or cfg[key] in (None, "")]
+    if missing:
+        raise VllmanError("missing required config keys: " + ", ".join(missing))
+
+    validate_name(str(cfg["name"]))
+
+    try:
+        port = int(cfg["port"])
+    except (TypeError, ValueError) as exc:
+        raise VllmanError("port must be an integer") from exc
+    if not (1 <= port <= 65535):
+        raise VllmanError("port must be between 1 and 65535")
+    cfg["port"] = port
+
+    options = cfg.get("options", {})
+    if options is None:
+        cfg["options"] = {}
+    elif isinstance(options, list):
+        cfg["options"] = normalize_options_list(options)
+    elif not isinstance(options, dict):
+        raise VllmanError("options must be a mapping/object")
+
+    volumes = cfg.get("volumes")
+    if volumes is not None and not isinstance(volumes, list):
+        raise VllmanError("volumes must be a list")
+
+    env = cfg.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise VllmanError("env must be a mapping/object")
+
+
+def normalize_options_list(options: list[Any]) -> dict[str, Any]:
+    """Allow legacy style: options: [{foo: 1}, {bar: true}]."""
+    normalized: dict[str, Any] = {}
+    for item in options:
+        if not isinstance(item, dict) or len(item) != 1:
+            raise VllmanError(
+                "list-style options must contain one-key mappings, e.g. - trust-remote-code: true"
+            )
+        key, value = next(iter(item.items()))
+        normalized[str(key)] = value
+    return normalized
+
+
+def container_name(cfg: dict[str, Any], prefix: str = DEFAULT_CONTAINER_PREFIX) -> str:
+    return f"{prefix}{cfg['name']}"
+
+
+def cli_value(value: Any) -> str:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"))
+    if value is None:
+        return ""
+    return str(value)
+
+
+def build_vllm_args(cfg: dict[str, Any]) -> list[str]:
+    args = [
+        "vllm",
+        "serve",
+        str(cfg["model"]),
+        "--host",
+        DEFAULT_CONTAINER_HOST,
+        "--port",
+        str(DEFAULT_CONTAINER_PORT),
+    ]
+
+    options = ensure_mapping(cfg.get("options", {}), "options")
+    for raw_key, value in options.items():
+        key = str(raw_key).replace("_", "-")
+        flag = f"--{key}"
+
+        if isinstance(value, bool):
+            if value:
+                args.append(flag)
+            continue
+
+        if value is None:
+            continue
+
+        args.append(flag)
+        args.append(cli_value(value))
+
+    extra_args = cfg.get("extra_args", [])
+    if extra_args:
+        if not isinstance(extra_args, list) or not all(isinstance(x, str) for x in extra_args):
+            raise VllmanError("extra_args must be a list of strings")
+        args.extend(extra_args)
+
+    return args
+
+
+def build_podman_run_args(
+    cfg: dict[str, Any],
+    *,
+    test: bool = False,
+    replace: bool = False,
+    prefix: str = DEFAULT_CONTAINER_PREFIX,
+) -> list[str]:
+    args = ["podman", "run"]
+
+    if test:
+        args += ["--rm", "-it"]
+    else:
+        args += ["-d", "--name", container_name(cfg, prefix)]
+        if replace:
+            args.append("--replace")
+
+    gpu = cfg.get("gpu")
+    if gpu not in (None, ""):
+        args += ["--gpus", str(gpu)]
+
+    network = cfg.get("network", DEFAULT_NETWORK)
+    if network:
+        args += ["--network", str(network)]
+
+    volumes = cfg.get("volumes")
+    if volumes is None:
+        volumes = [DEFAULT_HF_CACHE_VOLUME]
+    for volume in volumes:
+        args += ["-v", str(volume)]
+
+    env = cfg.get("env", {}) or {}
+    env = ensure_mapping(env, "env")
+    for key, value in env.items():
+        args += ["-e", f"{key}={value}"]
+
+    podman_args = cfg.get("podman_args", [])
+    if podman_args:
+        if not isinstance(podman_args, list) or not all(isinstance(x, str) for x in podman_args):
+            raise VllmanError("podman_args must be a list of strings")
+        args.extend(podman_args)
+
+    published_host = str(cfg.get("host", "::"))
+    published_port = int(cfg["port"])
+    args += ["-p", format_port_mapping(published_host, published_port, DEFAULT_CONTAINER_PORT)]
+
+    args.append(str(cfg["runtime"]))
+    args += build_vllm_args(cfg)
+    return args
+
+
+def format_port_mapping(host: str, host_port: int, container_port: int) -> str:
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        host = f"[{host}]"
+    return f"{host}:{host_port}:{container_port}"
+
+
+def run_command(args: list[str], *, dry_run: bool = False) -> None:
+    print(shlex.join(args))
+    if dry_run:
+        return
+    try:
+        subprocess.run(args, check=True)
+    except FileNotFoundError as exc:
+        raise VllmanError(f"command not found: {args[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(exc.returncode) from exc
+
+
+def load_for_args(args: argparse.Namespace) -> dict[str, Any]:
+    return load_config(args.name, Path(args.config_dir))
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    cfg = load_for_args(args)
+    run_command(build_podman_run_args(cfg, test=False, replace=args.replace, prefix=args.container_prefix), dry_run=args.dry_run)
+
+
+def cmd_test(args: argparse.Namespace) -> None:
+    cfg = load_for_args(args)
+    run_command(build_podman_run_args(cfg, test=True, replace=False, prefix=args.container_prefix), dry_run=args.dry_run)
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    cfg = load_for_args(args)
+    run_command(["podman", "start", container_name(cfg, args.container_prefix)], dry_run=args.dry_run)
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    cfg = load_for_args(args)
+    run_command(["podman", "stop", container_name(cfg, args.container_prefix)], dry_run=args.dry_run)
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    cfg = load_for_args(args)
+    run_command(["podman", "rm", "-f", container_name(cfg, args.container_prefix)], dry_run=args.dry_run)
+
+
+def cmd_restart(args: argparse.Namespace) -> None:
+    cfg = load_for_args(args)
+    run_command(["podman", "restart", container_name(cfg, args.container_prefix)], dry_run=args.dry_run)
+
+
+def cmd_logs(args: argparse.Namespace) -> None:
+    cfg = load_for_args(args)
+    cmd = ["podman", "logs"]
+    if args.follow:
+        cmd.append("-f")
+    if args.previous:
+        cmd.append("-p")
+    if args.tail is not None:
+        cmd += ["--tail", str(args.tail)]
+    cmd.append(container_name(cfg, args.container_prefix))
+    run_command(cmd, dry_run=args.dry_run)
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    cfg = load_for_args(args)
+    run_command(["podman", "ps", "-a", "--filter", f"name=^{container_name(cfg, args.container_prefix)}$"], dry_run=args.dry_run)
+
+
+def cmd_inspect(args: argparse.Namespace) -> None:
+    cfg = load_for_args(args)
+    run_command(["podman", "inspect", container_name(cfg, args.container_prefix)], dry_run=args.dry_run)
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    config_dir = Path(args.config_dir)
+    if not config_dir.exists():
+        raise VllmanError(f"config dir not found: {config_dir}")
+    for path in sorted(config_dir.glob("*.yaml")):
+        print(path.stem)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="vllman", description="YAML-driven Podman lifecycle wrapper for vLLM model runners.")
+    parser.add_argument("--config-dir", default=str(DEFAULT_CONFIG_DIR), help="directory containing <name>.yaml configs; default: %(default)s")
+    parser.add_argument("--container-prefix", default=DEFAULT_CONTAINER_PREFIX, help="container name prefix; default: %(default)s")
+    parser.add_argument("--dry-run", action="store_true", help="print the command without executing it")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("run", help="create and start a detached container from YAML")
+    p.add_argument("name")
+    p.add_argument("--replace", action="store_true", help="pass podman --replace when creating the container")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("test", help="run foreground/debug container with --rm -it")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_test)
+
+    for command, help_text, func in [
+        ("start", "start an existing container", cmd_start),
+        ("stop", "stop an existing container", cmd_stop),
+        ("remove", "remove an existing container with rm -f", cmd_remove),
+        ("rm", "alias for remove", cmd_remove),
+        ("restart", "restart an existing container", cmd_restart),
+        ("status", "show matching container status", cmd_status),
+        ("inspect", "inspect the matching container", cmd_inspect),
+    ]:
+        p = sub.add_parser(command, help=help_text)
+        p.add_argument("name")
+        p.set_defaults(func=func)
+
+    p = sub.add_parser("logs", help="show container logs")
+    p.add_argument("name")
+    p.add_argument("-f", "--follow", action="store_true", help="follow logs")
+    p.add_argument("-p", "--previous", action="store_true", help="show previous logs if supported")
+    p.add_argument("--tail", type=int, help="number of lines to show from the end")
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("list", help="list available YAML model runners")
+    p.set_defaults(func=cmd_list)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except VllmanError as exc:
+        die(str(exc))
+
+
+if __name__ == "__main__":
+    main()
