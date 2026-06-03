@@ -39,7 +39,7 @@ except ImportError:
 
 DEFAULT_CONFIG_DIR = Path(os.environ.get("VLLMAN_CONFIG_DIR", "/opt/modelrunners"))
 DEFAULT_CONTAINER_PREFIX = os.environ.get("VLLMAN_CONTAINER_PREFIX", "vllm-")
-DEFAULT_CONTAINER_HOST = "localhost"
+DEFAULT_CONTAINER_HOST = "::"
 DEFAULT_CONTAINER_PORT = 8000
 DEFAULT_NETWORK = os.environ.get("VLLMAN_NETWORK", "dualstack")
 DEFAULT_HF_CACHE_VOLUME = os.environ.get(
