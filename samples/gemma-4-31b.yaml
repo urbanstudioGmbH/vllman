@@ -1,0 +1,28 @@
+model: RedHatAI/gemma-4-31B-it-NVFP4
+name: gemma-4-31b
+runtime: vllm-base:260603-nightly-cu130
+gpu: "0"
+host: "127.0.0.1"
+port: 8013
+
+options:
+  tensor-parallel-size: 1
+  trust-remote-code: true
+  max-model-len: 131072
+  gpu-memory-utilization: 0.47
+  reasoning-parser: gemma4
+  tool-call-parser: gemma4
+  enable-auto-tool-choice: true
+  kv-cache-dtype: fp8
+  async-scheduling: true
+  enable-chunked-prefill: true
+  max-num-batched-tokens: 8192
+  enable-prefix-caching: true
+  limit-mm-per-prompt:
+    image: 32
+    audio: 0
+  default-chat-template-kwargs:
+    enable_thinking: false
+  speculative-config:
+    model: google/gemma-4-31B-it-assistant
+    num_speculative_tokens: 4
