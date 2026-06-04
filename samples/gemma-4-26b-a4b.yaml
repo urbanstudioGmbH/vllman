@@ -1,9 +1,9 @@
-model: RedHatAI/gemma-4-31B-it-NVFP4
-name: gemma-4-31b
+model: RedHatAI/gemma-4-26B-A4B-it-NVFP4
+name: gemma-4-26b-a4b
 runtime: vllm-base:260603-nightly-cu130
 gpu: "0"
 host: "127.0.0.1"
-port: 8013
+port: 8014
 
 options:
   tensor-parallel-size: 1                         # Just in here to explicitly note that this is TP=1
@@ -24,5 +24,5 @@ options:
   default-chat-template-kwargs:                    
     enable_thinking: false                        # deactivates reasoning be default
   speculative-config:
-    model: google/gemma-4-31B-it-assistant        # BF16 draft model
+    model: google/gemma-4-26B-A4B-it-assistant    # BF16 draft model
     num_speculative_tokens: 4                     # use 5 or 6 if the vast majority of work is structured output
